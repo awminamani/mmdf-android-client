@@ -1,0 +1,133 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Existing release tag to upload to (without the leading v). Example: 1.0.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/26.2.11394342
+      ANDROID_NDK_ROOT: /usr/local/lib/android/sdk/ndk/26.2.11394342
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync version from tag
+        run: |
+          set -euo pipefail
+          VER="${{ inputs.version || github.ref_name }}"
+          VER="${VER#v}"
+          echo "Release version: $VER"
+          python3 - "$VER" <<'PY'
+          import re, pathlib, sys
+          ver = sys.argv[1]
+          if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', ver):
+              sys.exit(f"ERROR: bad version '{ver}'")
+          p = pathlib.Path("Cargo.toml")
+          src = p.read_text()
+          new, n = re.subn(r'^(version\s*=\s*")[0-9.]+(")', rf'\g<1>{ver}\g<2>', src, count=1, flags=re.M)
+          assert n == 1, "Cargo.toml version line not found"
+          p.write_text(new)
+          print(f"Cargo.toml -> {ver}")
+          p = pathlib.Path("android/app/build.gradle.kts")
+          src = p.read_text()
+          m = re.search(r'versionCode\s*=\s*(\d+)', src)
+          assert m, "versionCode not found"
+          new_code = int(m.group(1)) + 1
+          src = src[:m.start(1)] + str(new_code) + src[m.end(1):]
+          src, n = re.subn(r'versionName\s*=\s*"[^"]+"', f'versionName = "{ver}"', src, count=1)
+          assert n == 1, "versionName not found"
+          p.write_text(src)
+          print(f"build.gradle.kts -> versionName={ver}, versionCode={new_code}")
+          PY
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mmdf-android
+          cache-bin: "false"
+          workspaces: |
+            . -> target
+
+      - name: Install Android NDK and cargo-ndk
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;26.2.11394342"
+          cargo install cargo-ndk --locked
+
+      - name: Build release APK
+        working-directory: android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Rename APKs with version
+        working-directory: android
+        run: |
+          VER="${{ inputs.version || github.ref_name }}"
+          VER="${VER#v}"
+          mkdir -p ../dist
+          declare -A MAP=(
+            ["universal"]="mmdf-android-universal-v${VER}.apk"
+            ["arm64-v8a"]="mmdf-android-arm64-v8a-v${VER}.apk"
+            ["armeabi-v7a"]="mmdf-android-armeabi-v7a-v${VER}.apk"
+            ["x86_64"]="mmdf-android-x86_64-v${VER}.apk"
+            ["x86"]="mmdf-android-x86-v${VER}.apk"
+          )
+          for abi in "${!MAP[@]}"; do
+            SRC="app/build/outputs/apk/release/app-${abi}-release.apk"
+            if [ -f "$SRC" ]; then
+              cp "$SRC" "../dist/${MAP[$abi]}"
+              ls -la "../dist/${MAP[$abi]}"
+            else
+              echo "::warning::missing expected APK: $SRC"
+            fi
+          done
+          if [ ! -f "../dist/mmdf-android-universal-v${VER}.apk" ]; then
+            echo "::error::universal APK missing; actual outputs:"
+            find app/build/outputs/apk -type f -name '*.apk' -print
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mmdf-android
+          path: dist/*.apk
+          if-no-files-found: error
+
+  publish:
+    needs: android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: mmdf-android
+          path: dist
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version && format('v{0}', inputs.version) || github.ref_name }}
+          name: ${{ inputs.version && format('v{0}', inputs.version) || github.ref_name }}
+          generate_release_notes: true
+          files: dist/*.apk
