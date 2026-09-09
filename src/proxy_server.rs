@@ -91,7 +91,7 @@ impl ProxyServer {
 }
 
 // tiny anyhow shim to avoid a new dep
-mod anyhow {
+pub(crate) mod anyhow {
     #[derive(Debug)]
     pub struct Error(String);
     impl std::fmt::Display for Error {
